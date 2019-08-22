@@ -4,13 +4,15 @@
 import requests
 from optparse import OptionParser
 import threading
+requests.packages.urllib3.disable_warnings()
 
 '''
     扫描脚本，每次学到新的漏洞时，尝试进行脚本自动化，每次更新进行版本记录。
     v1.0：spring-boot actuator xxe和rce漏洞，以及备份文件扫描
+    v1.1：多线程
 '''
 
-def spring_boot(host, thread_name):
+def spring_boot(host):
     # 将host处理为http://ip:port/形式
     if host[:4] == "http":
         if host[-1] == "/":
@@ -23,25 +25,25 @@ def spring_boot(host, thread_name):
         url = "http://" + host + "/"
     # 先扫描env，如果有，再扫描jolokia
     try:
-        response_1 = requests.get(url+"env", timeout=5)
+        response_1 = requests.get(url+"env", timeout=5, verify=False)
         if (response_1.status_code == 200) and ("profiles" in response_1.text):
-            print("\033[32m[+] %s\t Nice! find env : %s\033[0m" % (thread_name, url+"env"))
+            print("\033[32m[+] Nice! find env : %s\033[0m" % url+"env")
             vuln_url.append(url+"env")
-            response_2 = requests.get(url+"jolokia", timeout=5)
+            response_2 = requests.get(url+"jolokia", timeout=5, verify=False)
             if (response_2.status_code == 200) and ("request" in response_2.text):
-                print("\033[32m[+] %s\t Nice! find jolokia, try XXE or RCE : %s\033[0m" % ( thread_name,url+"jolokia"))
+                print("\033[32m[+] Nice! find jolokia, try XXE or RCE : %s\033[0m" % url+"jolokia")
                 vuln_url.append(url+"jolokia")
         else:
-            print("[-] %s\t404: %s" % (thread_name, url+"env"))
+            print("[-] 404: %s" % url+"env")
     except requests.exceptions.Timeout:
-        print("[-] %s\tconnect timeout: %s" % (thread_name, url+"env"))
+        print("[-] connect timeout: %s" % url+"env")
     except requests.exceptions.ConnectionError:
-        print("[-] %s\tconnect failed: %s" % (thread_name, url+"env"))
+        print("[-] connect failed: %s" % url+"env")
     except Exception as e:
-        print("[-] %s\tconnect with unknown error: %s" % (thread_name, url+"env"))
+        print("[-] connect with unknown error: %s" % url+"env")
 
 
-def backup(host, thread_name):
+def backup(host):
     # 将host处理为http://ip:port/形式
     if host[:4] == "http":
         if host[-1] == "/":
@@ -58,20 +60,20 @@ def backup(host, thread_name):
     for i in backup_file:
         try:
             full_url = url+i
-            response = requests.get(full_url, timeout=5)
+            response = requests.get(full_url, timeout=5, verify=False)
             if response.status_code == 200 and response.text != "":
-                print("\033[32m[+] %s\tNice! find backup : %s\033[0m" % (thread_name,full_url))
+                print("\033[32m[+] Nice! find backup : %s\033[0m" % full_url)
                 vuln_url.append(full_url)
             elif response.status_code == 404:
-                print("[-] %s\t404: %s" % (thread_name,full_url))
+                print("[-] 404: %s" % full_url)
         except requests.exceptions.Timeout:
-            print("[-] %s\tconnect timeout: %s" % (thread_name,full_url))
+            print("[-] connect timeout: %s" % full_url)
             continue
         except requests.exceptions.ConnectionError:
-            print("[-] %s\tconnect failed: %s" % (thread_name,full_url))
+            print("[-] connect failed: %s" % full_url)
             continue
         except:
-            print("[-] %s\tconnect with unknown error: %s" % (thread_name,full_url))
+            print("[-] connect with unknown error: %s" % full_url)
             continue
 
 
@@ -84,15 +86,6 @@ thread_list = []
 fun = [backup, spring_boot]
 fun_name = ["backup", "spring_boot"]
 
-# 启动多线程
-def run_thread(thread, module_num, host, thread_name):
-    for i in range(0, thread):
-        t = threading.Thread(target=fun[module_num], args=(host,thread_name,))
-        thread_list.append(t)
-    for i in range(0, thread):
-        thread_list[i].start()
-    for i in range(0, thread):
-        thread_list[i].join()
 
 # 匹配出指定模块，通过中间变量开启多线程
 def get_module(module):
@@ -102,20 +95,24 @@ def get_module(module):
     print("\033[31m[!] no such module! only: sprint_boot, backup\033[0m")
     exit()
 
-# 读n行数据，起n个线程，等这n个线程结束，再起n个线程，直到数据被读完
 def run_thread(uList, thread, module_num):
     f = open(uList, "r")
     host_list = f.readlines()
     count = 0
-    while count<(len(host_list)/thread):
-        for i in range(0, thread):
-            if (thread*count+i)<len(host_list):
-                t = threading.Thread(target=fun[module_num], args=(host_list[thread*count+i].strip(), "thread-"+str(i+1)))
-                thread_list.append(t)
-                thread_list[i].start()
-                thread_list[i].join()
-        del thread_list[:]
-        count += 1
+
+    for line in host_list:
+        t = threading.Thread(target=fun[module_num], args=(line.strip(),))
+        thread_list.append(t)
+
+    for i in range(0, len(thread_list)):
+        thread_list[i].start()
+        while True:
+            if len(threading.enumerate()) <= thread:
+                break
+    # 判断最后启动的n个线程是否结束，没结束的话，加上join，确保所有子线程结束之后再进入主线程的写文件操作
+    for j in range(len(thread_list)-thread, len(thread_list)):
+        if thread_list[j].isAlive():
+            thread_list[j].join()
 
 def main():
     usage ='''
@@ -127,7 +124,7 @@ def main():
      --module: specify scan module
      -t: thread, default is 5
      -o: output file, default is scanFile.txt
-     module: spring-boot, backup
+     module: sprin_boot, backup
     ************************************************'''
     # 定义输入参数
     parser = OptionParser(usage)  # 带参的话会把参数变量的内容作为帮助信息输出
@@ -136,6 +133,7 @@ def main():
     parser.add_option('--module', dest='module', type='string', help='specify scan module')
     parser.add_option('-t', dest='thread', type='int', default=5, help='thread number')
     parser.add_option('-o', dest='outfile', type='string', default='scanFile.txt', help='output file')
+
     (options, args) = parser.parse_args()
 
     # 给输入参数赋值
